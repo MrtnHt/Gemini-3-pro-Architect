@@ -25,10 +25,16 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: 'npm'
           
       - name: Install Dependencies
-        run: npm install
+        run: |
+          if [ -f package-lock.json ]; then
+            echo "package-lock.json found, running npm ci"
+            npm ci
+          else
+            echo "No package-lock.json found, running npm install"
+            npm install
+          fi
         
       - name: Build
         run: npm run build
