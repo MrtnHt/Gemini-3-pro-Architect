@@ -32,6 +32,10 @@ jobs:
         
       - name: Build
         run: npm run build
+        env:
+          VITE_GEMINI_API_KEY: ${{ secrets.VITE_GEMINI_API_KEY }}
+          VITE_FIREBASE_CONFIG_JSON: ${{ secrets.VITE_FIREBASE_CONFIG_JSON }}
+          VITE_APP_ID: "architect-pro-ultra-v3"
         
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
