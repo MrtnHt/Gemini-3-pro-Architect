@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { getFirestore, collection, addDoc, getDocs, onSnapshot, doc, setDoc, deleteDoc } from 'firebase/firestore';
+import { getFirestore, collection, addDoc, getDocs, onSnapshot, doc, setDoc, deleteDoc, query, orderBy, limit } from 'firebase/firestore';
 
 // Sleutel-parameters
 const MODELS = {
@@ -8,7 +8,7 @@ const MODELS = {
   gpt5mini: 'gpt-5-mini'
 };
 
-// Voorbeeld tarieven (EUR per 1M tokens) - update volgens actuele tarieven indien nodig
+// Voorbeeld tarieven (EUR per 1M tokens) - update volgens actuele tarieven
 const RATES_EUR_PER_1M = {
   gemini: 4.5,
   gpt5: 6.0,
@@ -49,27 +49,33 @@ const App = () => {
   const [apiKeyMissing, setApiKeyMissing] = useState(false);
   const [totalCost, setTotalCost] = useState(0);
 
-  // Knowledge module state
+  // Knowledge module
   const [knowledge, setKnowledge] = useState([]);
   const [newKnowledgeTitle, setNewKnowledgeTitle] = useState('');
   const [newKnowledgeContent, setNewKnowledgeContent] = useState('');
+
+  // Audit module
+  const [auditEntries, setAuditEntries] = useState([]);
+  const [avgGeminiResponseMs, setAvgGeminiResponseMs] = useState(null);
+  const [totalConsumedEuro, setTotalConsumedEuro] = useState(0);
+
+  // UI panel: 'knowledge' or 'audit'
+  const [panel, setPanel] = useState('knowledge');
 
   const messagesRef = useRef(messages);
   messagesRef.current = messages;
 
   const activeModel = MODELS[modelKey];
 
-  // Token & cost estimation helpers
+  // Helpers: tokens & cost
   const estimateTokens = (text) => {
     if (!text) return 0;
-    // eenvoudige schatting: ~4 chars per token
     return Math.max(1, Math.ceil(text.length / 4));
   };
 
   const calculateCost = (text, modelKeyParam = modelKey) => {
     const tokens = estimateTokens(text);
     const rate = RATES_EUR_PER_1M[modelKeyParam] ?? RATES_EUR_PER_1M.gemini;
-    // kosten = (tokens / 1_000_000) * rate
     return (tokens / 1_000_000) * rate;
   };
 
@@ -77,21 +83,32 @@ const App = () => {
     return '€' + Number(c).toFixed(6);
   };
 
-  // Check API key presence
+  // Re-evaluate API key presence whenever the active model changes or on mount
   useEffect(() => {
     try {
-      const provided = import.meta.env.VITE_OPENAI_API_KEY || import.meta.env.VITE_API_KEY;
-      if (!provided) {
-        console.warn('API key ontbreekt: VITE_OPENAI_API_KEY of VITE_API_KEY niet gevonden. Echte AI-aanroepen uitgeschakeld.');
-        setApiKeyMissing(true);
+      // For Gemini require VITE_GEMINI_API_KEY specifically
+      const geminiKey = import.meta.env.VITE_GEMINI_API_KEY;
+      const openaiKey = import.meta.env.VITE_OPENAI_API_KEY || import.meta.env.VITE_API_KEY;
+
+      let present = true;
+      if (modelKey === 'gemini') {
+        present = !!geminiKey;
+      } else {
+        present = !!openaiKey;
+      }
+
+      setApiKeyMissing(!present);
+
+      if (!present) {
+        console.warn('API key ontbreekt voor het geselecteerde model. Gemini vereist VITE_GEMINI_API_KEY; GPT modellen vereisen VITE_OPENAI_API_KEY of VITE_API_KEY.');
       }
     } catch (err) {
-      console.error('Fout bij het controleren van env keys:', err);
+      console.error('Fout bij controle van API keys:', err);
       setApiKeyMissing(true);
     }
-  }, []);
+  }, [modelKey]);
 
-  // Firestore: realtime kennismodule observer
+  // Firestore: realtime kennis listener
   useEffect(() => {
     let unsub = null;
     try {
@@ -105,8 +122,8 @@ const App = () => {
         console.warn('Realtime kennislistener faalde:', err.message || err);
       });
     } catch (err) {
-      console.warn('Firestore is mogelijk niet geïnitialiseerd; kennismodule werkt niet realtime:', err.message || err);
-      // fallback: probeer een eenmalige fetch
+      console.warn('Firestore niet beschikbaar voor kennislistener:', err.message || err);
+      // fallback: eenmalige fetch
       (async () => {
         try {
           const db = getFirestore();
@@ -119,8 +136,56 @@ const App = () => {
         }
       })();
     }
-
     return () => { if (typeof unsub === 'function') unsub(); };
+  }, []);
+
+  // Firestore: audit & consumption listeners
+  useEffect(() => {
+    let unsubAudit = null;
+    let unsubChat = null;
+    try {
+      const db = getFirestore();
+
+      // last 5 audit entries ordered by createdAt desc
+      const auditCol = collection(db, 'audit');
+      const auditQuery = query(auditCol, orderBy('createdAt', 'desc'), limit(5));
+      unsubAudit = onSnapshot(auditQuery, (snap) => {
+        const entries = [];
+        snap.forEach(d => entries.push({ id: d.id, ...d.data() }));
+        setAuditEntries(entries);
+      }, (err) => {
+        console.warn('Audit listener failed:', err.message || err);
+      });
+
+      // total consumption & average Gemini response time from audit collection (live)
+      const fullAuditCol = collection(db, 'audit');
+      unsubChat = onSnapshot(fullAuditCol, (snap) => {
+        let totalEuro = 0;
+        let geminiTimes = [];
+        snap.forEach(d => {
+          const data = d.data();
+          if (data.costEstimated) totalEuro += Number(data.costEstimated) || 0;
+          if (data.model === MODELS.gemini && data.responseTimeMs != null) geminiTimes.push(Number(data.responseTimeMs));
+        });
+        setTotalConsumedEuro(totalEuro);
+        if (geminiTimes.length > 0) {
+          const avg = geminiTimes.reduce((a, b) => a + b, 0) / geminiTimes.length;
+          setAvgGeminiResponseMs(avg);
+        } else {
+          setAvgGeminiResponseMs(null);
+        }
+      }, (err) => {
+        console.warn('Full audit listener failed:', err.message || err);
+      });
+
+    } catch (err) {
+      console.warn('Firestore not available for audit listeners:', err.message || err);
+    }
+
+    return () => {
+      if (typeof unsubAudit === 'function') unsubAudit();
+      if (typeof unsubChat === 'function') unsubChat();
+    };
   }, []);
 
   const downloadChatlog = () => {
@@ -141,32 +206,54 @@ const App = () => {
   const saveAIResponseToFirestore = async (responseText, metadata = {}) => {
     try {
       const db = getFirestore();
-      const docRef = await addDoc(collection(db, 'chatResponses'), {
+      await addDoc(collection(db, 'chatResponses'), {
         text: responseText,
         model: activeModel,
         metadata,
         createdAt: new Date().toISOString()
       });
-      console.log('AI response opgeslagen, id:', docRef.id);
+
+      // Also add an audit entry for this response (helps the audit module)
+      await addDoc(collection(db, 'audit'), {
+        action: 'ai_response',
+        model: activeModel,
+        costEstimated: Number(metadata.costEstimated) || 0,
+        responseTimeMs: metadata.responseTimeMs ?? null,
+        createdAt: new Date().toISOString(),
+        info: metadata.info || null
+      });
+
+      console.log('AI response + audit entry opgeslagen.');
     } catch (err) {
       console.warn('AI response niet opgeslagen (Firestor niet beschikbaar of permissies):', err.message || err);
     }
   };
 
-  // Knowledge module operations
+  // Knowledge ops with optimistic UI update
   const addKnowledge = async () => {
     if (!newKnowledgeTitle || !newKnowledgeContent) return;
+    const optimistic = {
+      id: 'local-' + Date.now(),
+      title: newKnowledgeTitle,
+      content: newKnowledgeContent,
+      createdAt: new Date().toISOString()
+    };
+
+    // Optimistisch tonen
+    setKnowledge(prev => [optimistic, ...prev]);
+    setNewKnowledgeTitle('');
+    setNewKnowledgeContent('');
+
     try {
       const db = getFirestore();
       await addDoc(collection(db, 'knowledge'), {
-        title: newKnowledgeTitle,
-        content: newKnowledgeContent,
-        createdAt: new Date().toISOString()
+        title: optimistic.title,
+        content: optimistic.content,
+        createdAt: optimistic.createdAt
       });
-      setNewKnowledgeTitle('');
-      setNewKnowledgeContent('');
+      // onSnapshot zal de echte doc binnenhalen en de lokale optimistische entry vervangen wanneer beschikbaar
     } catch (err) {
-      console.warn('Kon kennisitem niet toevoegen:', err.message || err);
+      console.warn('Kon kennisitem niet toevoegen aan Firestore:', err.message || err);
     }
   };
 
@@ -200,13 +287,17 @@ const App = () => {
     setTotalCost(prev => prev + userCost);
 
     setLoading(true);
+    let startMs = performance.now();
     try {
-      const apiKey = import.meta.env.VITE_OPENAI_API_KEY || import.meta.env.VITE_API_KEY;
+      // select the correct key depending on model
+      const geminiKey = import.meta.env.VITE_GEMINI_API_KEY;
+      const openaiKey = import.meta.env.VITE_OPENAI_API_KEY || import.meta.env.VITE_API_KEY;
+      const apiKey = modelKey === 'gemini' ? geminiKey : openaiKey;
+
       let aiText = '';
 
       if (!apiKey) {
         setApiKeyMissing(true);
-        // Simuleer een vriendelijk instructief antwoord
         aiText = 'API key ontbreekt. Dit is een lokale simulatie van het AI-antwoord. Voeg je API key toe in de environment variables om echte antwoorden te krijgen.';
       } else {
         const payload = {
@@ -233,6 +324,9 @@ const App = () => {
         aiText = data?.choices?.[0]?.message?.content ?? JSON.stringify(data);
       }
 
+      const endMs = performance.now();
+      const durationMs = Math.round(endMs - startMs);
+
       const aiMsg = { role: 'assistant', content: aiText };
 
       // cost voor AI antwoord
@@ -241,12 +335,24 @@ const App = () => {
 
       setMessages(prev => [...prev, aiMsg]);
 
-      // sla antwoord op in Firestore (indien beschikbaar)
-      await saveAIResponseToFirestore(aiText, { costEstimated: aiCost, length: aiText.length });
+      // sla antwoord en audit op in Firestore (indien beschikbaar)
+      await saveAIResponseToFirestore(aiText, { costEstimated: aiCost, length: aiText.length, responseTimeMs: durationMs });
 
     } catch (err) {
       console.error('Fout tijdens message flow:', err);
       setMessages(prev => [...prev, { role: 'system', content: 'Er trad een fout op bij het ophalen van een AI-antwoord. Bekijk de console.' }]);
+      // attempt to create an audit entry even in failure
+      try {
+        const db = getFirestore();
+        await addDoc(collection(db, 'audit'), {
+          action: 'ai_error',
+          model: activeModel,
+          error: String(err?.message ?? err),
+          createdAt: new Date().toISOString()
+        });
+      } catch (e) {
+        // ignore
+      }
     } finally {
       setLoading(false);
     }
@@ -258,7 +364,7 @@ const App = () => {
 
         {apiKeyMissing && (
           <div style={{ background: '#b22222', color: '#fff', padding: '10px', marginBottom: '12px', borderRadius: '6px' }}>
-            API key ontbreekt — echte AI-aanroepen en Firestore-schrijven kunnen beperkt zijn. Voeg VITE_OPENAI_API_KEY of VITE_API_KEY toe.
+            API key ontbreekt voor het geselecteerde model — sommige functies (echte AI-aanroepen, Firestore-writes) kunnen beperkt zijn. Voor Gemini voeg VITE_GEMINI_API_KEY toe; voor GPT modellen VITE_OPENAI_API_KEY of VITE_API_KEY.
           </div>
         )}
 
@@ -281,6 +387,11 @@ const App = () => {
           </div>
         </header>
 
+        <nav style={{ display: 'flex', gap: '8px', marginBottom: '12px' }}>
+          <button onClick={() => setPanel('knowledge')} style={{ padding: '8px', background: panel === 'knowledge' ? '#0e2233' : '#071225', color: '#fff', borderRadius: '6px' }}>Knowledge</button>
+          <button onClick={() => setPanel('audit')} style={{ padding: '8px', background: panel === 'audit' ? '#0e2233' : '#071225', color: '#fff', borderRadius: '6px' }}>Audit</button>
+        </nav>
+
         <main style={{ display: 'grid', gridTemplateColumns: '1fr 360px', gap: '16px', marginBottom: '12px' }}>
 
           <section>
@@ -299,32 +410,73 @@ const App = () => {
           </section>
 
           <aside>
-            <div style={{ padding: '12px', borderRadius: '8px', background: '#071225' }}>
-              <h3 style={{ marginTop: 0 }}>Knowledge Module</h3>
+            {panel === 'knowledge' && (
+              <div style={{ padding: '12px', borderRadius: '8px', background: '#071225' }}>
+                <h3 style={{ marginTop: 0 }}>Knowledge Module</h3>
 
-              <div style={{ marginBottom: '8px' }}>
-                <input placeholder='Titel' value={newKnowledgeTitle} onChange={(e) => setNewKnowledgeTitle(e.target.value)} style={{ width: '100%', marginBottom: '6px', padding: '8px', borderRadius: '6px', border: '1px solid #203040', background: '#031021', color: '#fff' }} />
-                <textarea placeholder='Inhoud' value={newKnowledgeContent} onChange={(e) => setNewKnowledgeContent(e.target.value)} rows={4} style={{ width: '100%', padding: '8px', borderRadius: '6px', border: '1px solid #203040', background: '#031021', color: '#fff' }} />
-                <div style={{ display: 'flex', gap: '8px', marginTop: '8px' }}>
-                  <button onClick={addKnowledge} style={{ padding: '8px 10px', cursor: 'pointer' }}>Toevoegen</button>
+                <div style={{ marginBottom: '8px' }}>
+                  <input placeholder='Titel' value={newKnowledgeTitle} onChange={(e) => setNewKnowledgeTitle(e.target.value)} style={{ width: '100%', marginBottom: '6px', padding: '8px', borderRadius: '6px', border: '1px solid #203040', background: '#031021', color: '#fff' }} />
+                  <textarea placeholder='Inhoud' value={newKnowledgeContent} onChange={(e) => setNewKnowledgeContent(e.target.value)} rows={4} style={{ width: '100%', padding: '8px', borderRadius: '6px', border: '1px solid #203040', background: '#031021', color: '#fff' }} />
+                  <div style={{ display: 'flex', gap: '8px', marginTop: '8px' }}>
+                    <button onClick={addKnowledge} style={{ padding: '8px 10px', cursor: 'pointer' }}>Toevoegen</button>
+                  </div>
+                </div>
+
+                <div style={{ maxHeight: '40vh', overflowY: 'auto' }}>
+                  {knowledge.length === 0 && <div style={{ color: '#9aa6b2' }}>Geen kennisitems gevonden.</div>}
+                  {knowledge.map(k => (
+                    <div key={k.id} style={{ marginBottom: '8px', padding: '8px', borderRadius: '6px', background: '#021827' }}>
+                      <div style={{ fontWeight: '600' }}>{k.title}</div>
+                      <div style={{ fontSize: '12px', whiteSpace: 'pre-wrap', marginBottom: '6px' }}>{k.content}</div>
+                      <div style={{ display: 'flex', gap: '8px' }}>
+                        <button onClick={() => { const updated = prompt('Bewerk inhoud:', k.content); if (updated !== null) updateKnowledge(k.id, { content: updated }); }} style={{ padding: '6px 8px' }}>Bewerk</button>
+                        <button onClick={() => deleteKnowledgeItem(k.id)} style={{ padding: '6px 8px' }}>Verwijder</button>
+                        <button onClick={() => { setMessages(prev => [...prev, { role: 'system', content: `Kennis item toegevoegd aan conversation context: ${k.title}` }, { role: 'assistant', content: k.content }]); }} style={{ padding: '6px 8px' }}>Gebruik</button>
+                      </div>
+                    </div>
+                  ))}
                 </div>
               </div>
+            )}
 
-              <div style={{ maxHeight: '40vh', overflowY: 'auto' }}>
-                {knowledge.length === 0 && <div style={{ color: '#9aa6b2' }}>Geen kennisitems gevonden.</div>}
-                {knowledge.map(k => (
-                  <div key={k.id} style={{ marginBottom: '8px', padding: '8px', borderRadius: '6px', background: '#021827' }}>
-                    <div style={{ fontWeight: '600' }}>{k.title}</div>
-                    <div style={{ fontSize: '12px', whiteSpace: 'pre-wrap', marginBottom: '6px' }}>{k.content}</div>
-                    <div style={{ display: 'flex', gap: '8px' }}>
-                      <button onClick={() => { const updated = prompt('Bewerk inhoud:', k.content); if (updated !== null) updateKnowledge(k.id, { content: updated }); }} style={{ padding: '6px 8px' }}>Bewerk</button>
-                      <button onClick={() => deleteKnowledgeItem(k.id)} style={{ padding: '6px 8px' }}>Verwijder</button>
-                      <button onClick={() => { setMessages(prev => [...prev, { role: 'system', content: `Kennis item toegevoegd aan conversation context: ${k.title}` }, { role: 'assistant', content: k.content }]); }} style={{ padding: '6px 8px' }}>Gebruik</button>
-                    </div>
-                  </div>
-                ))}
+            {panel === 'audit' && (
+              <div style={{ padding: '12px', borderRadius: '8px', background: '#071225' }}>
+                <h3 style={{ marginTop: 0 }}>Audit</h3>
+                <div style={{ marginBottom: '8px' }}>
+                  <div>Gemiddelde Gemini responstijd: <strong>{avgGeminiResponseMs == null ? 'n.v.t.' : Math.round(avgGeminiResponseMs) + ' ms'}</strong></div>
+                  <div>Totaal verbruik (EUR): <strong>{formattedCost(totalConsumedEuro)}</strong></div>
+                </div>
+
+                <div style={{ maxHeight: '48vh', overflowY: 'auto' }}>
+                  <table style={{ width: '100%', borderCollapse: 'collapse', color: '#fff' }}>
+                    <thead>
+                      <tr style={{ textAlign: 'left', borderBottom: '1px solid #203040' }}>
+                        <th style={{ padding: '6px' }}>Tijd</th>
+                        <th style={{ padding: '6px' }}>Actie</th>
+                        <th style={{ padding: '6px' }}>Model</th>
+                        <th style={{ padding: '6px' }}>Resp. (ms)</th>
+                        <th style={{ padding: '6px' }}>Kosten</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {auditEntries.length === 0 && (
+                        <tr><td colSpan={5} style={{ padding: '8px', color: '#9aa6b2' }}>Geen recente audit-acties gevonden.</td></tr>
+                      )}
+                      {auditEntries.map(a => (
+                        <tr key={a.id} style={{ borderBottom: '1px solid #0f2433' }}>
+                          <td style={{ padding: '6px', fontSize: '12px' }}>{new Date(a.createdAt).toLocaleString()}</td>
+                          <td style={{ padding: '6px', fontSize: '12px' }}>{a.action}</td>
+                          <td style={{ padding: '6px', fontSize: '12px' }}>{a.model || '-'}</td>
+                          <td style={{ padding: '6px', fontSize: '12px' }}>{a.responseTimeMs != null ? a.responseTimeMs + ' ms' : '-'}</td>
+                          <td style={{ padding: '6px', fontSize: '12px' }}>{a.costEstimated ? formattedCost(Number(a.costEstimated)) : '-'}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
               </div>
-            </div>
+            )}
+
           </aside>
 
         </main>
