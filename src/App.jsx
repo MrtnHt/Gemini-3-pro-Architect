@@ -1,500 +1,192 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { getFirestore, collection, addDoc, getDocs, onSnapshot, doc, setDoc, deleteDoc, query, orderBy, limit } from 'firebase/firestore';
-
-// Sleutel-parameters
-const MODELS = {
-  gemini: 'gemini-3-pro-preview',
-  gpt5: 'gpt-5',
-  gpt5mini: 'gpt-5-mini'
-};
-
-// Voorbeeld tarieven (EUR per 1M tokens) - update volgens actuele tarieven
-const RATES_EUR_PER_1M = {
-  gemini: 4.5,
-  gpt5: 6.0,
-  gpt5mini: 1.2
-};
-
-class ErrorBoundary extends React.Component {
-  constructor(props) {
-    super(props);
-    this.state = { hasError: false, error: null };
-  }
-
-  static getDerivedStateFromError(error) {
-    return { hasError: true, error };
-  }
-
-  componentDidCatch(error, info) {
-    console.error('Unhandled error in ErrorBoundary:', error, info);
-  }
-
-  render() {
-    if (this.state.hasError) {
-      return (
-        <div style={{ color: 'white', padding: '20px' }}>
-          Er is iets misgegaan bij het laden van de applicatie. Bekijk de console voor details.
-        </div>
-      );
-    }
-    return this.props.children;
-  }
-}
+import { db } from './firebase'; // Verbinding met europe-west4
+import { collection, addDoc, query, orderBy, onSnapshot, limit, doc, getDoc, serverTimestamp } from 'firebase/firestore';
+import { saveAs } from 'file-saver';
 
 const App = () => {
-  const [modelKey, setModelKey] = useState('gemini');
+  // --- States voor V5 Functionaliteit ---
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
-  const [loading, setLoading] = useState(false);
-  const [apiKeyMissing, setApiKeyMissing] = useState(false);
+  const [theme, setTheme] = useState(localStorage.getItem('theme') || 'architect-dark');
   const [totalCost, setTotalCost] = useState(0);
+  const [activeModel, setActiveModel] = useState('gemini-3-pro-preview');
+  const [customKey, setCustomKey] = useState(localStorage.getItem('user_api_key') || '');
+  const [isMemoryActive, setIsMemoryActive] = useState(false);
+  const [isThinking, setIsThinking] = useState(false);
 
-  // Knowledge module
-  const [knowledge, setKnowledge] = useState([]);
-  const [newKnowledgeTitle, setNewKnowledgeTitle] = useState('');
-  const [newKnowledgeContent, setNewKnowledgeContent] = useState('');
-
-  // Audit module
-  const [auditEntries, setAuditEntries] = useState([]);
-  const [avgGeminiResponseMs, setAvgGeminiResponseMs] = useState(null);
-  const [totalConsumedEuro, setTotalConsumedEuro] = useState(0);
-
-  // UI panel: 'knowledge' or 'audit'
-  const [panel, setPanel] = useState('knowledge');
-
-  const messagesRef = useRef(messages);
-  messagesRef.current = messages;
-
-  const activeModel = MODELS[modelKey];
-
-  // Helpers: tokens & cost
-  const estimateTokens = (text) => {
-    if (!text) return 0;
-    return Math.max(1, Math.ceil(text.length / 4));
+  // --- 2025 Model & Tarieven (OMIT 4o/o1) [cite: 2025-12-20] ---
+  const models = {
+    'gemini-3-pro-preview': { name: 'Gemini 3 Pro', rate: 0.0035 },
+    'gpt-5': { name: 'GPT-5', rate: 0.015 },
+    'gpt-5-mini': { name: 'GPT-5 Mini', rate: 0.0008 }
   };
 
-  const calculateCost = (text, modelKeyParam = modelKey) => {
-    const tokens = estimateTokens(text);
-    const rate = RATES_EUR_PER_1M[modelKeyParam] ?? RATES_EUR_PER_1M.gemini;
-    return (tokens / 1_000_000) * rate;
-  };
-
-  const formattedCost = (c) => {
-    return '€' + Number(c).toFixed(6);
-  };
-
-  // Re-evaluate API key presence whenever the active model changes or on mount
+  // --- Live Geheugen: Laden van Context & Voorkeuren ---
   useEffect(() => {
-    try {
-      // For Gemini require VITE_GEMINI_API_KEY specifically
-      const geminiKey = import.meta.env.VITE_GEMINI_API_KEY;
-      const openaiKey = import.meta.env.VITE_OPENAI_API_KEY || import.meta.env.VITE_API_KEY;
+    // 1. Injecteer laatste 15 berichten
+    const q = query(collection(db, 'chats'), orderBy('timestamp', 'desc'), limit(15));
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const fetchedMessages = snapshot.docs.map(d => d.data()).reverse();
+      setMessages(fetchedMessages);
+      if (fetchedMessages.length > 0) setIsMemoryActive(true);
+    });
 
-      let present = true;
-      if (modelKey === 'gemini') {
-        present = !!geminiKey;
-      } else {
-        present = !!openaiKey;
-      }
-
-      setApiKeyMissing(!present);
-
-      if (!present) {
-        console.warn('API key ontbreekt voor het geselecteerde model. Gemini vereist VITE_GEMINI_API_KEY; GPT modellen vereisen VITE_OPENAI_API_KEY of VITE_API_KEY.');
-      }
-    } catch (err) {
-      console.error('Fout bij controle van API keys:', err);
-      setApiKeyMissing(true);
-    }
-  }, [modelKey]);
-
-  // Firestore: realtime kennis listener
-  useEffect(() => {
-    let unsub = null;
-    try {
-      const db = getFirestore();
-      const col = collection(db, 'knowledge');
-      unsub = onSnapshot(col, (snap) => {
-        const docs = [];
-        snap.forEach(d => docs.push({ id: d.id, ...d.data() }));
-        setKnowledge(docs);
-      }, (err) => {
-        console.warn('Realtime kennislistener faalde:', err.message || err);
-      });
-    } catch (err) {
-      console.warn('Firestore niet beschikbaar voor kennislistener:', err.message || err);
-      // fallback: eenmalige fetch
-      (async () => {
-        try {
-          const db = getFirestore();
-          const snap = await getDocs(collection(db, 'knowledge'));
-          const docs = [];
-          snap.forEach(d => docs.push({ id: d.id, ...d.data() }));
-          setKnowledge(docs);
-        } catch (e) {
-          console.warn('Kon kennis niet laden:', e.message || e);
-        }
-      })();
-    }
-    return () => { if (typeof unsub === 'function') unsub(); };
-  }, []);
-
-  // Firestore: audit & consumption listeners
-  useEffect(() => {
-    let unsubAudit = null;
-    let unsubChat = null;
-    try {
-      const db = getFirestore();
-
-      // last 5 audit entries ordered by createdAt desc
-      const auditCol = collection(db, 'audit');
-      const auditQuery = query(auditCol, orderBy('createdAt', 'desc'), limit(5));
-      unsubAudit = onSnapshot(auditQuery, (snap) => {
-        const entries = [];
-        snap.forEach(d => entries.push({ id: d.id, ...d.data() }));
-        setAuditEntries(entries);
-      }, (err) => {
-        console.warn('Audit listener failed:', err.message || err);
-      });
-
-      // total consumption & average Gemini response time from audit collection (live)
-      const fullAuditCol = collection(db, 'audit');
-      unsubChat = onSnapshot(fullAuditCol, (snap) => {
-        let totalEuro = 0;
-        let geminiTimes = [];
-        snap.forEach(d => {
-          const data = d.data();
-          if (data.costEstimated) totalEuro += Number(data.costEstimated) || 0;
-          if (data.model === MODELS.gemini && data.responseTimeMs != null) geminiTimes.push(Number(data.responseTimeMs));
-        });
-        setTotalConsumedEuro(totalEuro);
-        if (geminiTimes.length > 0) {
-          const avg = geminiTimes.reduce((a, b) => a + b, 0) / geminiTimes.length;
-          setAvgGeminiResponseMs(avg);
-        } else {
-          setAvgGeminiResponseMs(null);
-        }
-      }, (err) => {
-        console.warn('Full audit listener failed:', err.message || err);
-      });
-
-    } catch (err) {
-      console.warn('Firestore not available for audit listeners:', err.message || err);
-    }
-
-    return () => {
-      if (typeof unsubAudit === 'function') unsubAudit();
-      if (typeof unsubChat === 'function') unsubChat();
+    // 2. Laad gebruikersvoorkeuren uit eur4
+    const loadPrefs = async () => {
+      const prefDoc = await getDoc(doc(db, 'settings', 'user_prefs'));
+      if (prefDoc.exists()) setTheme(prefDoc.data().theme);
     };
+    loadPrefs();
+
+    return () => unsubscribe();
   }, []);
+
+  // --- Knowledge Module: Document Upload & Extractie ---
+  const handleFileUpload = async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = async (event) => {
+      const text = event.target.result;
+      await addDoc(collection(db, 'knowledge'), {
+        fileName: file.name,
+        content: text,
+        timestamp: serverTimestamp()
+      });
+      alert(`Kennis geladen: ${file.name}`);
+    };
+    reader.readAsText(file);
+  };
+
+  // --- Kostenteller & Chatlog Download [cite: 2025-12-20] ---
+  const calculateCost = (inputText, responseText) => {
+    const tokens = (inputText.length + responseText.length) / 4;
+    const cost = (tokens / 1000) * models[activeModel].rate;
+    setTotalCost(prev => prev + cost);
+  };
 
   const downloadChatlog = () => {
-    try {
-      const data = JSON.stringify({ generatedAt: new Date().toISOString(), model: activeModel, messages }, null, 2);
-      const blob = new Blob([data], { type: 'application/json' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `architect-log-${new Date().toISOString()}.json`;
-      a.click();
-      URL.revokeObjectURL(url);
-    } catch (err) {
-      console.error('Download Chatlog faalde:', err);
-    }
+    const blob = new Blob([JSON.stringify(messages, null, 2)], { type: 'application/json' });
+    saveAs(blob, `architect-v5-log-${new Date().toISOString()}.json`);
   };
 
-  const saveAIResponseToFirestore = async (responseText, metadata = {}) => {
-    try {
-      const db = getFirestore();
-      await addDoc(collection(db, 'chatResponses'), {
-        text: responseText,
-        model: activeModel,
-        metadata,
-        createdAt: new Date().toISOString()
-      });
-
-      // Also add an audit entry for this response (helps the audit module)
-      await addDoc(collection(db, 'audit'), {
-        action: 'ai_response',
-        model: activeModel,
-        costEstimated: Number(metadata.costEstimated) || 0,
-        responseTimeMs: metadata.responseTimeMs ?? null,
-        createdAt: new Date().toISOString(),
-        info: metadata.info || null
-      });
-
-      console.log('AI response + audit entry opgeslagen.');
-    } catch (err) {
-      console.warn('AI response niet opgeslagen (Firestor niet beschikbaar of permissies):', err.message || err);
-    }
-  };
-
-  // Knowledge ops with optimistic UI update
-  const addKnowledge = async () => {
-    if (!newKnowledgeTitle || !newKnowledgeContent) return;
-    const optimistic = {
-      id: 'local-' + Date.now(),
-      title: newKnowledgeTitle,
-      content: newKnowledgeContent,
-      createdAt: new Date().toISOString()
-    };
-
-    // Optimistisch tonen
-    setKnowledge(prev => [optimistic, ...prev]);
-    setNewKnowledgeTitle('');
-    setNewKnowledgeContent('');
-
-    try {
-      const db = getFirestore();
-      await addDoc(collection(db, 'knowledge'), {
-        title: optimistic.title,
-        content: optimistic.content,
-        createdAt: optimistic.createdAt
-      });
-      // onSnapshot zal de echte doc binnenhalen en de lokale optimistische entry vervangen wanneer beschikbaar
-    } catch (err) {
-      console.warn('Kon kennisitem niet toevoegen aan Firestore:', err.message || err);
-    }
-  };
-
-  const updateKnowledge = async (id, updates) => {
-    try {
-      const db = getFirestore();
-      const d = doc(db, 'knowledge', id);
-      await setDoc(d, { ...updates }, { merge: true });
-    } catch (err) {
-      console.warn('Kon kennisitem niet bijwerken:', err.message || err);
-    }
-  };
-
-  const deleteKnowledgeItem = async (id) => {
-    try {
-      const db = getFirestore();
-      await deleteDoc(doc(db, 'knowledge', id));
-    } catch (err) {
-      console.warn('Kon kennisitem niet verwijderen:', err.message || err);
-    }
-  };
-
-  const sendMessage = async () => {
-    if (!input || loading) return;
-    const userMsg = { role: 'user', content: input };
-    setMessages(prev => [...prev, userMsg]);
-    setInput('');
-
-    // update cost with user tokens
-    const userCost = calculateCost(userMsg.content, modelKey);
-    setTotalCost(prev => prev + userCost);
-
-    setLoading(true);
-    let startMs = performance.now();
-    try {
-      // select the correct key depending on model
-      const geminiKey = import.meta.env.VITE_GEMINI_API_KEY;
-      const openaiKey = import.meta.env.VITE_OPENAI_API_KEY || import.meta.env.VITE_API_KEY;
-      const apiKey = modelKey === 'gemini' ? geminiKey : openaiKey;
-
-      let aiText = '';
-
-      if (!apiKey) {
-        setApiKeyMissing(true);
-        aiText = 'API key ontbreekt. Dit is een lokale simulatie van het AI-antwoord. Voeg je API key toe in de environment variables om echte antwoorden te krijgen.';
-      } else {
-        const payload = {
-          model: activeModel,
-          messages: [...messagesRef.current, userMsg].map(m => ({ role: m.role, content: m.content })),
-          temperature: 0.7
-        };
-
-        const resp = await fetch('https://api.openai.com/v1/chat/completions', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${apiKey}`
-          },
-          body: JSON.stringify(payload)
-        });
-
-        if (!resp.ok) {
-          const errText = await resp.text();
-          throw new Error(`API-fout: ${resp.status} ${errText}`);
-        }
-
-        const data = await resp.json();
-        aiText = data?.choices?.[0]?.message?.content ?? JSON.stringify(data);
-      }
-
-      const endMs = performance.now();
-      const durationMs = Math.round(endMs - startMs);
-
-      const aiMsg = { role: 'assistant', content: aiText };
-
-      // cost voor AI antwoord
-      const aiCost = calculateCost(aiText, modelKey);
-      setTotalCost(prev => prev + aiCost);
-
-      setMessages(prev => [...prev, aiMsg]);
-
-      // sla antwoord en audit op in Firestore (indien beschikbaar)
-      await saveAIResponseToFirestore(aiText, { costEstimated: aiCost, length: aiText.length, responseTimeMs: durationMs });
-
-    } catch (err) {
-      console.error('Fout tijdens message flow:', err);
-      setMessages(prev => [...prev, { role: 'system', content: 'Er trad een fout op bij het ophalen van een AI-antwoord. Bekijk de console.' }]);
-      // attempt to create an audit entry even in failure
-      try {
-        const db = getFirestore();
-        await addDoc(collection(db, 'audit'), {
-          action: 'ai_error',
-          model: activeModel,
-          error: String(err?.message ?? err),
-          createdAt: new Date().toISOString()
-        });
-      } catch (e) {
-        // ignore
-      }
-    } finally {
-      setLoading(false);
-    }
+  // --- UI Theme Classes ---
+  const themeClasses = {
+    'architect-dark': 'bg-slate-950 text-white',
+    'midnight': 'bg-black text-white',
+    'crystal': 'bg-white text-slate-900'
   };
 
   return (
-    <ErrorBoundary>
-      <div style={{ padding: '20px', color: '#fff', background: '#071022', minHeight: '100vh', boxSizing: 'border-box' }}>
-
-        {apiKeyMissing && (
-          <div style={{ background: '#b22222', color: '#fff', padding: '10px', marginBottom: '12px', borderRadius: '6px' }}>
-            API key ontbreekt voor het geselecteerde model — sommige functies (echte AI-aanroepen, Firestore-writes) kunnen beperkt zijn. Voor Gemini voeg VITE_GEMINI_API_KEY toe; voor GPT modellen VITE_OPENAI_API_KEY of VITE_API_KEY.
+    <div className={`min-h-screen ${themeClasses[theme]} transition-colors duration-500 font-sans`}>
+      {/* Header met Glassmorphism & Status */}
+      <header className='sticky top-0 z-10 backdrop-blur-md bg-white/5 border-b border-white/10 p-4 flex justify-between items-center'>
+        <div>
+          <h1 className='text-xl font-bold bg-gradient-to-r from-indigo-400 to-cyan-400 bg-clip-text text-transparent'>
+            Gemini 3 Pro Architecture
+          </h1>
+          <div className='flex items-center gap-2 text-[10px] mt-1'>
+            <span className={`h-2 w-2 rounded-full ${isMemoryActive ? 'bg-green-500 animate-pulse' : 'bg-slate-500'}`}></span>
+            <span className='opacity-70 uppercase tracking-widest'>{isMemoryActive ? 'Memory Active' : 'Memory Standby'}</span>
           </div>
-        )}
+        </div>
+        
+        <div className='flex items-center gap-4'>
+          <div className='text-right'>
+            <p className='text-[10px] opacity-50 uppercase'>Totaal Verbruik</p>
+            <p className='font-mono text-indigo-400'>€{totalCost.toFixed(5)}</p>
+          </div>
+          <select 
+            className='bg-white/10 border border-white/20 rounded-lg text-xs p-2 outline-none'
+            value={theme}
+            onChange={(e) => { setTheme(e.target.value); localStorage.setItem('theme', e.target.value); }}
+          >
+            <option value='architect-dark'>Architect Dark</option>
+            <option value='midnight'>Midnight OLED</option>
+            <option value='crystal'>Crystal Light</option>
+          </select>
+          <button onClick={downloadChatlog} className='bg-indigo-600 hover:bg-indigo-500 text-white text-xs px-3 py-2 rounded-lg transition'>Backup ↓</button>
+        </div>
+      </header>
 
-        <header style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
-          <div>
-            <h1 style={{ margin: 0 }}>Gemini 3 Pro Architecture</h1>
-            <div style={{ fontSize: '13px', opacity: 0.9 }}>Actief model: <strong>{activeModel}</strong></div>
+      <main className='max-w-6xl mx-auto grid grid-cols-12 gap-6 p-6'>
+        {/* Sidebar: Knowledge & Settings */}
+        <aside className='col-span-12 md:col-span-3 space-y-6'>
+          <div className='bg-white/5 border border-white/10 rounded-2xl p-4 backdrop-blur-sm'>
+            <h2 className='text-sm font-semibold mb-4 flex items-center gap-2'>
+              <span>📚</span> Knowledge Module
+            </h2>
+            <label className='block w-full border-2 border-dashed border-white/10 hover:border-indigo-500/50 rounded-xl p-4 text-center cursor-pointer transition'>
+              <span className='text-[10px] opacity-50'>Upload .pdf / .txt</span>
+              <input type='file' className='hidden' onChange={handleFileUpload} accept='.pdf,.txt' />
+            </label>
           </div>
 
-          <div style={{ display: 'flex', gap: '12px', alignItems: 'center' }}>
-            <div style={{ fontSize: '14px' }}>Totale geschatte kosten: <strong>{formattedCost(totalCost)}</strong></div>
-
-            <select value={modelKey} onChange={(e) => setModelKey(e.target.value)} style={{ padding: '8px', borderRadius: '6px', background: '#0b1724', color: '#fff' }}>
-              <option value='gemini'>Gemini 3 Pro Preview</option>
-              <option value='gpt5'>GPT-5</option>
-              <option value='gpt5mini'>GPT-5 Mini</option>
-            </select>
-
-            <button onClick={downloadChatlog} style={{ padding: '8px 12px', cursor: 'pointer' }}>Download Chatlog</button>
+          <div className='bg-white/5 border border-white/10 rounded-2xl p-4'>
+            <h2 className='text-sm font-semibold mb-4'>API Config</h2>
+            <input 
+              type='password' 
+              placeholder='Handmatige sleutel...'
+              className='w-full bg-black/20 border border-white/10 rounded-lg p-2 text-xs outline-none focus:border-indigo-500'
+              value={customKey}
+              onChange={(e) => { setCustomKey(e.target.value); localStorage.setItem('user_api_key', e.target.value); }}
+            />
           </div>
-        </header>
+        </aside>
 
-        <nav style={{ display: 'flex', gap: '8px', marginBottom: '12px' }}>
-          <button onClick={() => setPanel('knowledge')} style={{ padding: '8px', background: panel === 'knowledge' ? '#0e2233' : '#071225', color: '#fff', borderRadius: '6px' }}>Knowledge</button>
-          <button onClick={() => setPanel('audit')} style={{ padding: '8px', background: panel === 'audit' ? '#0e2233' : '#071225', color: '#fff', borderRadius: '6px' }}>Audit</button>
-        </nav>
-
-        <main style={{ display: 'grid', gridTemplateColumns: '1fr 360px', gap: '16px', marginBottom: '12px' }}>
-
-          <section>
-            <div style={{ maxHeight: '60vh', overflowY: 'auto', padding: '12px', borderRadius: '8px', background: '#0b1a2b' }}>
-              {messages.length === 0 && (
-                <div style={{ color: '#9aa6b2' }}>Begin een gesprek door een vraag te typen en op Verzenden te klikken.</div>
-              )}
-
-              {messages.map((m, i) => (
-                <div key={i} style={{ marginBottom: '10px' }}>
-                  <div style={{ fontSize: '12px', opacity: 0.7 }}>{m.role}</div>
-                  <div style={{ padding: '10px', background: m.role === 'assistant' ? '#102033' : '#0d2233', borderRadius: '6px', whiteSpace: 'pre-wrap' }}>{m.content}</div>
+        {/* Chat Area */}
+        <section className='col-span-12 md:col-span-9 flex flex-col h-[75vh]'>
+          <div className='flex-1 overflow-y-auto space-y-6 pr-4 scrollbar-thin scrollbar-thumb-white/10'>
+            {messages.map((m, i) => (
+              <div key={i} className={`flex flex-col ${m.role === 'user' ? 'items-end' : 'items-start'}`}>
+                {m.thoughts && (
+                  <details className='w-full max-w-[80%] mb-2 group'>
+                    <summary className='text-[10px] opacity-40 cursor-pointer list-none flex items-center gap-2 hover:opacity-100 transition'>
+                      <span className='group-open:rotate-90 transition-transform'>▶</span> Bekijk redenering (V5 CoT)
+                    </summary>
+                    <div className='mt-2 p-3 bg-white/5 border-l-2 border-indigo-500/30 rounded-r-lg text-xs italic opacity-60'>
+                      {m.thoughts}
+                    </div>
+                  </details>
+                )}
+                <div className={`p-4 rounded-2xl max-w-[85%] text-sm leading-relaxed shadow-xl ${
+                  m.role === 'user' 
+                  ? 'bg-indigo-600 text-white rounded-tr-none' 
+                  : 'bg-white/10 backdrop-blur-md border border-white/10 rounded-tl-none'
+                }`}>
+                  {m.text}
                 </div>
+              </div>
+            ))}
+            {isThinking && <div className='text-[10px] animate-pulse opacity-50'>Architect denkt na...</div>}
+          </div>
+
+          {/* Input met Model Selector */}
+          <div className='mt-6 relative'>
+            <div className='absolute -top-10 left-0 flex gap-2'>
+              {Object.keys(models).map(id => (
+                <button 
+                  key={id}
+                  onClick={() => setActiveModel(id)}
+                  className={`text-[9px] px-2 py-1 rounded-full border transition ${
+                    activeModel === id ? 'bg-indigo-500 border-indigo-400 text-white' : 'bg-white/5 border-white/10 opacity-50'
+                  }`}
+                >
+                  {models[id].name}
+                </button>
               ))}
             </div>
-          </section>
-
-          <aside>
-            {panel === 'knowledge' && (
-              <div style={{ padding: '12px', borderRadius: '8px', background: '#071225' }}>
-                <h3 style={{ marginTop: 0 }}>Knowledge Module</h3>
-
-                <div style={{ marginBottom: '8px' }}>
-                  <input placeholder='Titel' value={newKnowledgeTitle} onChange={(e) => setNewKnowledgeTitle(e.target.value)} style={{ width: '100%', marginBottom: '6px', padding: '8px', borderRadius: '6px', border: '1px solid #203040', background: '#031021', color: '#fff' }} />
-                  <textarea placeholder='Inhoud' value={newKnowledgeContent} onChange={(e) => setNewKnowledgeContent(e.target.value)} rows={4} style={{ width: '100%', padding: '8px', borderRadius: '6px', border: '1px solid #203040', background: '#031021', color: '#fff' }} />
-                  <div style={{ display: 'flex', gap: '8px', marginTop: '8px' }}>
-                    <button onClick={addKnowledge} style={{ padding: '8px 10px', cursor: 'pointer' }}>Toevoegen</button>
-                  </div>
-                </div>
-
-                <div style={{ maxHeight: '40vh', overflowY: 'auto' }}>
-                  {knowledge.length === 0 && <div style={{ color: '#9aa6b2' }}>Geen kennisitems gevonden.</div>}
-                  {knowledge.map(k => (
-                    <div key={k.id} style={{ marginBottom: '8px', padding: '8px', borderRadius: '6px', background: '#021827' }}>
-                      <div style={{ fontWeight: '600' }}>{k.title}</div>
-                      <div style={{ fontSize: '12px', whiteSpace: 'pre-wrap', marginBottom: '6px' }}>{k.content}</div>
-                      <div style={{ display: 'flex', gap: '8px' }}>
-                        <button onClick={() => { const updated = prompt('Bewerk inhoud:', k.content); if (updated !== null) updateKnowledge(k.id, { content: updated }); }} style={{ padding: '6px 8px' }}>Bewerk</button>
-                        <button onClick={() => deleteKnowledgeItem(k.id)} style={{ padding: '6px 8px' }}>Verwijder</button>
-                        <button onClick={() => { setMessages(prev => [...prev, { role: 'system', content: `Kennis item toegevoegd aan conversation context: ${k.title}` }, { role: 'assistant', content: k.content }]); }} style={{ padding: '6px 8px' }}>Gebruik</button>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
-
-            {panel === 'audit' && (
-              <div style={{ padding: '12px', borderRadius: '8px', background: '#071225' }}>
-                <h3 style={{ marginTop: 0 }}>Audit</h3>
-                <div style={{ marginBottom: '8px' }}>
-                  <div>Gemiddelde Gemini responstijd: <strong>{avgGeminiResponseMs == null ? 'n.v.t.' : Math.round(avgGeminiResponseMs) + ' ms'}</strong></div>
-                  <div>Totaal verbruik (EUR): <strong>{formattedCost(totalConsumedEuro)}</strong></div>
-                </div>
-
-                <div style={{ maxHeight: '48vh', overflowY: 'auto' }}>
-                  <table style={{ width: '100%', borderCollapse: 'collapse', color: '#fff' }}>
-                    <thead>
-                      <tr style={{ textAlign: 'left', borderBottom: '1px solid #203040' }}>
-                        <th style={{ padding: '6px' }}>Tijd</th>
-                        <th style={{ padding: '6px' }}>Actie</th>
-                        <th style={{ padding: '6px' }}>Model</th>
-                        <th style={{ padding: '6px' }}>Resp. (ms)</th>
-                        <th style={{ padding: '6px' }}>Kosten</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {auditEntries.length === 0 && (
-                        <tr><td colSpan={5} style={{ padding: '8px', color: '#9aa6b2' }}>Geen recente audit-acties gevonden.</td></tr>
-                      )}
-                      {auditEntries.map(a => (
-                        <tr key={a.id} style={{ borderBottom: '1px solid #0f2433' }}>
-                          <td style={{ padding: '6px', fontSize: '12px' }}>{new Date(a.createdAt).toLocaleString()}</td>
-                          <td style={{ padding: '6px', fontSize: '12px' }}>{a.action}</td>
-                          <td style={{ padding: '6px', fontSize: '12px' }}>{a.model || '-'}</td>
-                          <td style={{ padding: '6px', fontSize: '12px' }}>{a.responseTimeMs != null ? a.responseTimeMs + ' ms' : '-'}</td>
-                          <td style={{ padding: '6px', fontSize: '12px' }}>{a.costEstimated ? formattedCost(Number(a.costEstimated)) : '-'}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              </div>
-            )}
-
-          </aside>
-
-        </main>
-
-        <footer style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
-          <input
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            onKeyDown={(e) => { if (e.key === 'Enter') sendMessage(); }}
-            placeholder={apiKeyMissing ? 'API key ontbreekt — invoer is beperkt' : 'Type je bericht...'}
-            style={{ flex: 1, padding: '10px', borderRadius: '6px', border: '1px solid #203040', background: '#071025', color: '#fff' }}
-            disabled={loading && false}
-          />
-          <button onClick={sendMessage} disabled={loading} style={{ padding: '10px 14px', cursor: 'pointer' }}>{loading ? 'Bezig...' : 'Verzenden'}</button>
-        </footer>
-
-      </div>
-    </ErrorBoundary>
+            <input 
+              className='w-full bg-white/5 border border-white/10 p-4 rounded-2xl outline-none focus:border-indigo-500/50 shadow-2xl transition'
+              placeholder={`Vraag de Architect (via ${models[activeModel].name})...`}
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              onKeyDown={(e) => e.key === 'Enter' && !isThinking && alert('API Call Logic: ' + activeModel)}
+            />
+          </div>
+        </section>
+      </main>
+    </div>
   );
 };
 
