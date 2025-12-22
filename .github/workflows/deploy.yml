@@ -1,60 +1,31 @@
-name: Deploy React App
 
+name: Deploy React App
 on:
   push:
-    branches: ["main"]
-  workflow_dispatch:
-
-permissions:
-  contents: read
-  pages: write
-  id-token: write
-
-concurrency:
-  group: "pages"
-  cancel-in-progress: true
-
+    branches: [ main ]
 jobs:
-  build:
+  build-and-deploy:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
-      
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          
-      - name: Install Dependencies
-        run: |
-          if [ -f package-lock.json ]; then
-            echo "package-lock.json found, running npm ci"
-            npm ci
-          else
-            echo "No package-lock.json found, running npm install"
-            npm install
-          fi
-        
-      - name: Build
-        run: npm run build
-        env:
-          VITE_GEMINI_API_KEY: ${{ secrets.VITE_GEMINI_API_KEY }}
-          VITE_FIREBASE_CONFIG_JSON: ${{ secrets.VITE_FIREBASE_CONFIG_JSON }}
-          VITE_APP_ID: "architect-pro-ultra-v3"
-        
-      - name: Upload artifact
-        uses: actions/upload-pages-artifact@v3
-        with:
-          path: ./dist
+        uses: actions/checkout@v3
 
-  deploy:
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    needs: build
-    runs-on: ubuntu-latest
-    steps:
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v4
+      - name: Set up Node
+        uses: actions/setup-node@v3
+        with:
+          node-version: 18
+
+      - name: Install and Build
+        env:
+          VITE_GEMINI_KEY: ${{ secrets.VITE_GEMINI_KEY }}
+          CI: false
+        run: |
+          npm install
+          npm run build
+
+      - name: Deploy
+        uses: JamesIves/github-pages-deploy-action@v4
+        with:
+          folder: dist
+          branch: gh-pages
+
