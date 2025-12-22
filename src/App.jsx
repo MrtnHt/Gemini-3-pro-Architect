@@ -20,7 +20,7 @@ const App = () => {
     e.preventDefault();
     if (!input.trim()) return;
     try {
-      await addDoc(collection(db, "chats"), {
+      setCost(prev => prev + 0.00015); await addDoc(collection(db, "chats"), {
         text: input,
         timestamp: serverTimestamp(),
         user: "Architect_Master",
