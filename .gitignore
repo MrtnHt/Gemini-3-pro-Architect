@@ -5,3 +5,7 @@ node_modules
 .env.*.local
 .vscode
 .idea
+# gemini-cli settings
+.gemini/
+# GitHub App credentials
+gha-creds-*.json
